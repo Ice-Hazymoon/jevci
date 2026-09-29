@@ -25,6 +25,18 @@ export interface JevciJob {
     threshold?: number;
     /** Typical duration in minutes, for savings reports. */
     minutes?: number;
+    /**
+     * Files outside `paths` that the job still reads, such as a test that scans another package's source.
+     * A change to one runs the job when an added or removed line matches `pattern` (any change without one),
+     * without asking Jev.
+     */
+    triggers?: readonly JevciTrigger[];
+}
+
+/** A content rule: a change to `files` whose changed lines match `pattern` runs the job. */
+export interface JevciTrigger {
+    files: readonly string[];
+    pattern?: RegExp;
 }
 
 /** Normalizes one file type for comment- and format-only change detection. */
@@ -113,6 +125,7 @@ export interface ResolvedJevciJob {
     formatting: boolean;
     threshold?: number;
     minutes?: number;
+    triggers: readonly JevciTrigger[];
 }
 
 export interface ResolvedJevOptions {
@@ -144,7 +157,9 @@ export interface ResolvedJevciConfig {
 export const DEFAULT_DIRECTIVES = /@ts-(?:expect-error|ignore|nocheck|check)|eslint|prettier-ignore|biome-ignore|istanbul|[cv]8 ignore|#__PURE__|@__PURE__|@__NO_SIDE_EFFECTS__|webpack[A-Z]|@vite-ignore|<reference|@jsx|@vitest-environment|@jest-environment|sourceMappingURL|@deprecated|@type\b|@typedef|@template|@satisfies|@param\s*\{|@returns?\s*\{/;
 
 const CONFIG_FILE_NAMES = ['jevci.config.ts', 'jevci.config.mts', 'jevci.config.js', 'jevci.config.mjs'];
-const JOB_ID = /^[\w-]+$/;
+const JOB_ID = /^[\w-]+(?:\/[\w-]+)?$/;
+/** Plan outputs a matrix group may not be named after. */
+const RESERVED_OUTPUTS = new Set(['level', 'jobs', 'reason', 'fallback']);
 
 /** The config is malformed; the message names every problem. */
 export class JevciConfigError extends Error {
@@ -185,6 +200,10 @@ const JOB_FIELDS: Record<string, Field> = {
     formatting: BOOLEAN,
     threshold: PROBABILITY,
     minutes: POSITIVE,
+    triggers: {
+        valid: value => Array.isArray(value) && value.every(item => isObject(item) && isStringList(item.files) && (item.pattern === undefined || item.pattern instanceof RegExp) && Object.keys(item).every(key => key === 'files' || key === 'pattern')),
+        expected: 'an array of { files: string[], pattern?: RegExp }',
+    },
 };
 const FORCE_FIELDS: Record<string, Field> = { markers: STRINGS, labels: STRINGS, events: STRINGS };
 const NOOP_FIELDS: Record<string, Field> = {
@@ -219,7 +238,10 @@ function fieldProblems(value: Record<string, unknown>, fields: Record<string, Fi
 
 function jobProblems(id: string, job: unknown): string[] {
     const where = `jobs["${id}"]`;
-    const badId = JOB_ID.test(id) ? [] : [`${where}: a job id may contain letters, digits, "-" and "_" only (it becomes an output key).`];
+    const group = id.includes('/') ? id.slice(0, id.indexOf('/')) : undefined;
+    const badId = !JOB_ID.test(id)
+        ? [`${where}: a job id may contain letters, digits, "-" and "_", plus one "/" between a matrix job and its entry (it becomes an output key).`]
+        : group && RESERVED_OUTPUTS.has(group) ? [`${where}: "${group}" is a plan output of its own, so it cannot name a matrix group.`] : [];
     return [...badId, ...(isObject(job) ? fieldProblems(job, JOB_FIELDS, where, ['checks']) : [`${where} must be an object.`])];
 }
 
@@ -228,6 +250,8 @@ function problems(config: unknown): string[] {
     const found = fieldProblems(config, CONFIG_FIELDS, 'config', ['jobs']);
     const jobs = isObject(config.jobs) ? config.jobs : {};
     found.push(...Object.entries(jobs).flatMap(([id, job]) => jobProblems(id, job)));
+    const groups = new Set(Object.keys(jobs).filter(id => id.includes('/')).map(id => id.slice(0, id.indexOf('/'))));
+    found.push(...[...groups].filter(group => group in jobs).map(group => `jobs["${group}"]: "${group}" is also a matrix group ("${group}/…"); a workflow job is either one job or a matrix.`));
     const minimum = isStringList(config.minimumJobs) ? config.minimumJobs : [];
     found.push(...minimum.filter(id => !(id in jobs)).map(id => `config.minimumJobs names unknown job "${id}".`));
     const sections: Array<[unknown, Record<string, Field>, string]> = [[config.force, FORCE_FIELDS, 'force'], [config.noop, NOOP_FIELDS, 'noop'], [config.jev, JEV_FIELDS, 'jev']];
@@ -273,6 +297,8 @@ function resolveJob(job: JevciJob): ResolvedJevciJob {
         formatting: job.formatting ?? false,
         threshold: job.threshold,
         minutes: job.minutes,
+        // A global or sticky RegExp keeps state between `test` calls.
+        triggers: (job.triggers ?? []).map(trigger => ({ files: trigger.files, ...(trigger.pattern ? { pattern: new RegExp(trigger.pattern.source, trigger.pattern.flags.replace(/[gy]/g, '')) } : {}) })),
     };
 }
 

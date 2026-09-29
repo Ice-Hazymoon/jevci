@@ -58,13 +58,30 @@ export function formatMarkdown(plan: Plan): string {
     return `${lines.join('\n')}\n`;
 }
 
-/** Step outputs: `level`, `jobs` (JSON object of job id → boolean), `reason`, `fallback`. */
+/** Matrix groups: `test/api`, `test/web` → `{ test: ['api'] }`, the entries that run, in config order. */
+export function matrixGroups(plan: Plan): Record<string, string[]> {
+    const groups: Record<string, string[]> = {};
+    for (const [id, job] of Object.entries(plan.jobs)) {
+        const slash = id.indexOf('/');
+        if (slash === -1) { continue; }
+        const entries = groups[id.slice(0, slash)] ??= [];
+        if (job.run) { entries.push(id.slice(slash + 1)); }
+    }
+    return groups;
+}
+
+/**
+ * Step outputs: `level`, `jobs` (JSON object of job id → boolean), `reason`, `fallback`, and per matrix
+ * group a JSON array of the entries that run (`test` → `["api","web"]`).
+ */
 export function githubOutputs(plan: Plan): Record<string, string> {
+    const groups = Object.fromEntries(Object.entries(matrixGroups(plan)).map(([group, entries]) => [group, JSON.stringify(entries)]));
     return {
         level: plan.level,
         jobs: JSON.stringify(Object.fromEntries(Object.entries(plan.jobs).map(([id, job]) => [id, job.run]))),
         reason: plan.reason,
         fallback: plan.fallback ?? '',
+        ...groups,
     };
 }
 
@@ -80,9 +97,9 @@ export function writeGithub(plan: Plan, env: NodeJS.ProcessEnv = process.env): v
     if (env.GITHUB_STEP_SUMMARY) { appendFileSync(env.GITHUB_STEP_SUMMARY, formatMarkdown(plan)); }
 }
 
-/** The variable a job's decision is exported as: `lint` → `JEVCI_RUN_LINT`, `test-e2e` → `JEVCI_RUN_TEST_E2E`. */
+/** The variable a job's decision is exported as: `lint` → `JEVCI_RUN_LINT`, `test-e2e` → `JEVCI_RUN_TEST_E2E`, `test/api` → `JEVCI_RUN_TEST_API`. */
 export function jobVariable(id: string): string {
-    return `JEVCI_RUN_${id.toUpperCase().replace(/-/g, '_')}`;
+    return `JEVCI_RUN_${id.toUpperCase().replace(/[-/]/g, '_')}`;
 }
 
 /** `JEVCI_LEVEL` and one `JEVCI_RUN_<JOB>=true|false` per job, e.g. for a GitLab `dotenv` report. */

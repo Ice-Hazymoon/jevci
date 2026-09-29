@@ -1,11 +1,11 @@
-export type { JevciConfig, JevciJevOptions, JevciJob, JevciNormalizer, JevciProvider, ResolvedJevciConfig, ResolvedJevciJob, ResolvedJevOptions } from './config.js';
+export type { JevciConfig, JevciJevOptions, JevciJob, JevciNormalizer, JevciProvider, JevciTrigger, ResolvedJevciConfig, ResolvedJevciJob, ResolvedJevOptions } from './config.js';
 export { DEFAULT_DIRECTIVES, defineConfig, findConfigFile, JevciConfigError, loadConfig, resolveConfig } from './config.js';
 export type { CiContext, TCiProvider } from './context.js';
 export { detectContext } from './context.js';
 export type { Evidence } from './evidence.js';
-export { collectEvidence, removedTexts } from './evidence.js';
+export { collectEvidence, evidenceFrom, removedTexts } from './evidence.js';
 export type { ChangedFile, TChangeStatus } from './git.js';
-export { changedFiles, JevciRangeError, resolveRange } from './git.js';
+export { changedFiles, filesContainingEach, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange } from './git.js';
 export { globToRegExp, matchesAny, matchesGlob } from './glob.js';
 export type { JevClient, JevClientOptions } from './jev.js';
 export { createJevClient, JevciKeyError, JevciRequestError } from './jev.js';
@@ -16,7 +16,9 @@ export { normalize, normalizeCss, normalizeJson, normalizeMarkup, normalizeScrip
 export type { FilePlan, JobPlan, Plan, PlanInput, TFileVerdict, TPlanLevel } from './plan.js';
 export { createPlan, fullPlan, PLAN_SCHEMA_VERSION } from './plan.js';
 export type { TReportFormat } from './report.js';
-export { formatDotenv, formatMarkdown, formatPlan, formatText, githubOutputs, jobVariable, REPORT_FORMATS, writeGithub } from './report.js';
+export { formatDotenv, formatMarkdown, formatPlan, formatText, githubOutputs, jobVariable, matrixGroups, REPORT_FORMATS, writeGithub } from './report.js';
 export { exportedNames, removedExports } from './surface.js';
-export type { CheckFinding, WorkflowJob } from './workflow.js';
-export { checkWorkflow, draftConfig, findWorkflow, guardFor, readWorkflow, workflowSnippet } from './workflow.js';
+export type { CheckFinding, PathFilter, WorkflowJob } from './workflow.js';
+export { checkWorkflow, configGroups, draftConfig, findWorkflow, guardFor, matrixFor, matrixGuardFor, readPathFilter, readWorkflow, triggersWorkflow, workflowSnippet } from './workflow.js';
+export type { Workspace, WorkspacePackage, WorkspacePathsOptions } from './workspace.js';
+export { dependencyClosure, findWorkspaceRoot, readWorkspace, workspacePaths } from './workspace.js';

@@ -36,12 +36,11 @@ export function removedTexts(diff: string, limit: number = TEXT_LIMIT): string[]
     return [...found].slice(0, limit);
 }
 
-/** Looks up each removed text in the test files at `rev`. */
-export function collectEvidence(root: string, rev: string, diff: string, testFiles: readonly string[]): Evidence {
+/** The evidence for one diff from a lookup of removed text → test files containing it (see `filesContainingEach`). */
+export function evidenceFrom(diff: string, hits: ReadonlyMap<string, readonly string[]>): Evidence {
     const evidence: Evidence = { testsContainingRemovedText: [], removedTextNotInTests: [] };
-    if (testFiles.length === 0) { return evidence; }
     for (const text of removedTexts(diff)) {
-        const files = filesContaining(root, rev, text, testFiles);
+        const files = hits.get(text) ?? [];
         if (files.length) {
             evidence.testsContainingRemovedText.push({ text, files: files.slice(0, FILES_PER_TEXT) });
         } else {
@@ -49,4 +48,10 @@ export function collectEvidence(root: string, rev: string, diff: string, testFil
         }
     }
     return evidence;
+}
+
+/** Looks up each removed text in the test files at `rev`. */
+export function collectEvidence(root: string, rev: string, diff: string, testFiles: readonly string[]): Evidence {
+    if (testFiles.length === 0) { return { testsContainingRemovedText: [], removedTextNotInTests: [] }; }
+    return evidenceFrom(diff, new Map(removedTexts(diff).map(text => [text, filesContaining(root, rev, text, testFiles)])));
 }

@@ -6,6 +6,7 @@ import type { ResolvedJevciConfig } from './config.js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
+import { matchesAny, matchesGlob } from './glob.js';
 
 export interface WorkflowJob {
     id: string;
@@ -14,6 +15,10 @@ export interface WorkflowJob {
     needs: string[];
     /** A step runs `jevci plan`. */
     runsPlan: boolean;
+    /** `strategy.matrix`, serialized, so the expressions in it can be searched. */
+    matrix?: string;
+    /** The job's `outputs` map. */
+    outputs: Record<string, string>;
 }
 
 export interface CheckFinding {
@@ -40,7 +45,9 @@ function toWorkflowJob(id: string, job: unknown): WorkflowJob {
     const needs = Array.isArray(body.needs) ? body.needs.map(String) : typeof body.needs === 'string' ? [body.needs] : [];
     const condition = body.if === undefined ? undefined : String(body.if).replace(/^\s*\$\{\{([\s\S]*)\}\}\s*$/, '$1').trim();
     const steps = Array.isArray(body.steps) ? body.steps.filter(isObject) : [];
-    return { id, if: condition, needs, runsPlan: steps.some(step => RUNS_PLAN.test(`${String(step.run ?? '')} ${String(step.uses ?? '')}`)) };
+    const matrix = isObject(body.strategy) && body.strategy.matrix !== undefined ? JSON.stringify(body.strategy.matrix) : undefined;
+    const outputs = isObject(body.outputs) ? Object.fromEntries(Object.entries(body.outputs).map(([key, value]) => [key, String(value)])) : {};
+    return { id, if: condition, needs, runsPlan: steps.some(step => RUNS_PLAN.test(`${String(step.run ?? '')} ${String(step.uses ?? '')}`)), ...(matrix ? { matrix } : {}), outputs };
 }
 
 export function readWorkflow(path: string): WorkflowJob[] {
@@ -52,6 +59,28 @@ export function readWorkflow(path: string): WorkflowJob[] {
 /** The recommended `if:` for a gated job: run when the plan says so, and whenever the plan job did not succeed. */
 export function guardFor(planJob: string, id: string): string {
     return `\${{ !cancelled() && (needs.${planJob}.result != 'success' || fromJSON(needs.${planJob}.outputs.jobs || '{}')['${id}']) }}`;
+}
+
+/** The recommended `if:` for a matrix job: run when any entry is planned, and whenever the plan job did not succeed. */
+export function matrixGuardFor(planJob: string, group: string): string {
+    return `\${{ !cancelled() && (needs.${planJob}.result != 'success' || needs.${planJob}.outputs.${group} != '[]') }}`;
+}
+
+/** The recommended matrix list for a group: the planned entries, or every entry when the plan job did not succeed. */
+export function matrixFor(planJob: string, group: string, entries: readonly string[]): string {
+    return `\${{ fromJSON(needs.${planJob}.result == 'success' && needs.${planJob}.outputs.${group} || '${JSON.stringify(entries)}') }}`;
+}
+
+/** `test/api`, `test/web` → `{ test: ['api', 'web'] }`, in config order. */
+export function configGroups(config: ResolvedJevciConfig): Map<string, string[]> {
+    const groups = new Map<string, string[]>();
+    for (const id of Object.keys(config.jobs)) {
+        const slash = id.indexOf('/');
+        if (slash === -1) { continue; }
+        const group = id.slice(0, slash);
+        groups.set(group, [...groups.get(group) ?? [], id.slice(slash + 1)]);
+    }
+    return groups;
 }
 
 /** Whether an `if:` reads this job's entry of the plan's `jobs` output. */
@@ -75,6 +104,32 @@ function checkJob(config: ResolvedJevciConfig, job: WorkflowJob, planJob: string
     return findings;
 }
 
+/** A matrix job gated by its group output: the job runs when any entry is planned, and the matrix lists the planned entries. */
+function checkGroup(job: WorkflowJob, planJob: string, entries: readonly string[]): CheckFinding[] {
+    const findings: CheckFinding[] = [];
+    const error = (message: string): number => findings.push({ severity: 'error', job: job.id, message });
+    const output = `needs.${planJob}.outputs.${job.id}`;
+    if (!job.needs.includes(planJob)) { error(`does not list "${planJob}" in needs, so it cannot read the plan.`); }
+    if (!(job.if ?? '').includes(output)) {
+        error(`its if: does not read ${output}. Use: if: ${matrixGuardFor(planJob, job.id)}`);
+    } else if (!(job.if ?? '').includes(`needs.${planJob}.result`)) {
+        findings.push({ severity: 'warning', job: job.id, message: `is skipped when the plan job fails; also run it then: if: ${matrixGuardFor(planJob, job.id)}` });
+    }
+    if (!job.matrix?.includes(output)) {
+        error(`its strategy.matrix does not read ${output}, so every entry runs whatever the plan says. List the entries with: ${matrixFor(planJob, job.id, entries)}`);
+    } else {
+        const unlisted = entries.filter(entry => !job.matrix!.includes(`"${entry}"`) && !job.matrix!.includes(`\\"${entry}\\"`));
+        if (unlisted.length) { error(`the matrix fallback (used when the plan job fails) misses ${unlisted.join(', ')}. Use: ${matrixFor(planJob, job.id, entries)}`); }
+    }
+    return findings;
+}
+
+/** Outputs the plan job must forward so the gated jobs can read them. */
+function checkPlanOutputs(plan: WorkflowJob, config: ResolvedJevciConfig, groups: ReadonlyMap<string, readonly string[]>): CheckFinding[] {
+    const wanted = [...(Object.keys(config.jobs).some(id => !id.includes('/')) ? ['jobs'] : []), ...groups.keys()];
+    return wanted.filter(name => !plan.outputs[name]?.includes(`outputs.${name}`)).map(name => ({ severity: 'error' as const, job: plan.id, message: `does not forward the "${name}" output. Add under outputs: ${name}: \${{ steps.<plan step id>.outputs.${name} }}` }));
+}
+
 /** The plan job's id, or an error finding when it is missing or ambiguous. */
 function findPlanJob(jobs: readonly WorkflowJob[], planJobId: string | undefined): string | CheckFinding {
     if (planJobId) { return jobs.some(job => job.id === planJobId) ? planJobId : { severity: 'error', message: `plan job "${planJobId}" is not in the workflow.` }; }
@@ -88,10 +143,47 @@ export function checkWorkflow(config: ResolvedJevciConfig, jobs: readonly Workfl
     const planJob = findPlanJob(jobs, planJobId);
     if (typeof planJob !== 'string') { return [planJob]; }
     const byId = new Map(jobs.map(job => [job.id, job]));
-    const missing = Object.keys(config.jobs).filter(id => !byId.has(id)).map(id => ({ severity: 'error' as const, job: id, message: 'is in the config but not in the workflow; rename or remove it.' }));
-    const gated = Object.keys(config.jobs).flatMap(id => (byId.has(id) ? checkJob(config, byId.get(id)!, planJob) : []));
-    const ungoverned = jobs.filter(job => job.id !== planJob && !(job.id in config.jobs)).map(job => ({ severity: 'warning' as const, job: job.id, message: 'is not in the config, so it runs on every change.' }));
-    return [...missing, ...gated, ...ungoverned];
+    const groups = configGroups(config);
+    const single = Object.keys(config.jobs).filter(id => !id.includes('/'));
+    const missing = [...single, ...groups.keys()].filter(id => !byId.has(id)).map(id => ({ severity: 'error' as const, job: id, message: 'is in the config but not in the workflow; rename or remove it.' }));
+    const gated = single.flatMap(id => (byId.has(id) ? checkJob(config, byId.get(id)!, planJob) : []));
+    const matrices = [...groups].flatMap(([group, entries]) => (byId.has(group) ? checkGroup(byId.get(group)!, planJob, entries) : []));
+    const ungoverned = jobs.filter(job => job.id !== planJob && !(job.id in config.jobs) && !groups.has(job.id)).map(job => ({ severity: 'warning' as const, job: job.id, message: 'is not in the config, so it runs on every change.' }));
+    return [...checkPlanOutputs(byId.get(planJob)!, config, groups), ...missing, ...gated, ...matrices, ...ungoverned];
+}
+
+/** The `paths` / `paths-ignore` filter of one workflow trigger. */
+export interface PathFilter { paths?: readonly string[]; pathsIgnore?: readonly string[] }
+
+/** The path filter of `event` in a workflow file, when it has one. */
+export function readPathFilter(path: string, event: string): PathFilter | undefined {
+    const document: unknown = parse(readFileSync(path, 'utf8'));
+    const on = isObject(document) ? document.on : undefined;
+    const trigger = isObject(on) ? on[event] : undefined;
+    if (!isObject(trigger)) { return undefined; }
+    const list = (value: unknown): string[] | undefined => (Array.isArray(value) ? value.map(String) : undefined);
+    const filter = { paths: list(trigger.paths), pathsIgnore: list(trigger['paths-ignore']) };
+    return filter.paths || filter.pathsIgnore ? filter : undefined;
+}
+
+/**
+ * Whether a change to `files` triggers the workflow, as GitHub decides it: with `paths-ignore`, unless every
+ * file is ignored; with `paths`, when a file matches, a later `!pattern` excluding what an earlier one included.
+ */
+export function triggersWorkflow(filter: PathFilter | undefined, files: readonly string[]): boolean {
+    if (!filter) { return true; }
+    if (filter.pathsIgnore) { return files.some(file => !matchesAny(filter.pathsIgnore!, file)); }
+    return files.some((file) => {
+        let included = false;
+        for (const pattern of filter.paths ?? []) {
+            if (pattern.startsWith('!')) {
+                if (matchesGlob(file, pattern.slice(1))) { included = false; }
+            } else if (matchesGlob(file, pattern)) {
+                included = true;
+            }
+        }
+        return included;
+    });
 }
 
 /** Linters and formatters read comments and layout, so a draft runs them on comment- and format-only edits too. */

@@ -76,6 +76,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the plan diffs against the merge base
+          filter: blob:none # full history without every file's content; jevci fetches the blobs it reads in batches
       # Only jevci is installed; the project's dependencies are not needed to plan.
       - id: plan
         run: npx --yes @hazymoon/jevci plan --format github
@@ -92,7 +93,7 @@ jobs:
 
 With `--format github`, the plan job:
 
-- writes the outputs `level` (`none`, `partial` or `full`), `jobs` (a JSON object of job id → boolean), `reason` and `fallback`;
+- writes the outputs `level` (`none`, `partial` or `full`), `jobs` (a JSON object of job id → boolean), `reason` and `fallback`, plus one output per matrix group (see below);
 - adds a table of jobs and reasons to the run summary.
 
 The guard above also runs the job whenever the plan job itself did not succeed. GitHub treats a job skipped by `if:` as passing, so required status checks still pass.
@@ -105,6 +106,70 @@ Pull request, push, merge queue, schedule and manual events are read from the ev
           path: ~/.cache/jevci
           key: jevci-${{ github.sha }}
           restore-keys: jevci-
+```
+
+On a large repository, `filter: blob:none` keeps the plan job's checkout to seconds: history and trees arrive at once, and file contents only for the files jevci reads. jevci fetches those in batches (the changed files through `git diff`, the test files it searches for evidence in one request), where a plain read in a partial clone would fetch one file per request.
+
+### Matrix jobs
+
+A job-level `if:` cannot read `matrix`, so a matrix job is planned per entry through a group: name its jobs `<workflow job>/<entry>` in the config, and the plan writes an output named after the group with the entries that run, as a JSON array. The workflow builds the matrix from it:
+
+```yaml
+  plan:
+    outputs:
+      jobs: ${{ steps.plan.outputs.jobs }}
+      test: ${{ steps.plan.outputs.test }}
+    # ...
+
+  test:
+    needs: plan
+    if: ${{ !cancelled() && (needs.plan.result != 'success' || needs.plan.outputs.test != '[]') }}
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(needs.plan.result == 'success' && needs.plan.outputs.test || '["api","web"]') }}
+    runs-on: ubuntu-latest
+    steps:
+      # ...
+```
+
+```ts
+jobs: {
+    'test/api': { checks: 'Vitest tests of apps/api.', paths: ['apps/api/**', 'packages/**'] },
+    'test/web': { checks: 'Vitest tests of apps/web.', paths: ['apps/web/**', 'packages/**'] },
+},
+```
+
+The list after `||` is every entry, so a failed plan job runs them all. `jevci check` verifies the guard, that the matrix reads the group output, that the fallback list names every entry, and that the plan job forwards the output. In dotenv, `test/api` becomes `JEVCI_RUN_TEST_API`.
+
+## Monorepos
+
+A job that tests or builds some workspace packages can fail after a change in any package they depend on, directly or not. `workspacePaths` turns package names into `paths` from the workspace graph (`pnpm-workspace.yaml`, or `workspaces` in `package.json` for npm, Yarn and Bun), when the config loads:
+
+```ts
+import { defineConfig, readWorkspace, workspacePaths } from '@hazymoon/jevci';
+
+const workspace = readWorkspace();
+const tested = [...workspace.packages.values()].filter(pkg => pkg.scripts.includes('test')).map(pkg => pkg.name);
+
+export default defineConfig({
+    jobs: {
+        'test/api': { checks: '...', paths: workspacePaths(['@acme/api'], { workspace }) },
+        'test/rest': { checks: '...', paths: workspacePaths(tested.filter(name => name !== '@acme/api'), { workspace }) },
+    },
+});
+```
+
+Names may be globs (`@acme/*`, or `**` for every package); a name that matches no package is a config error, so a renamed package cannot silently empty a job's paths. The result covers the packages' directories only: add the root files the job reads (its CI config, shared tsconfig, files its tests open by path) yourself, or put them in `full`.
+
+A test that reads another package's files by path is invisible to the dependency graph. When it reads only part of what changes there, a trigger keeps the job from running on every edit:
+
+```ts
+'test/admin-api': {
+    checks: '...',
+    paths: workspacePaths(['@acme/admin-api'], { workspace }),
+    // Its parity test counts which procedures the front end calls.
+    triggers: [{ files: ['apps/front/src/**'], pattern: /\b(api|queries)\.[\w.]+\(/ }],
+},
 ```
 
 ## GitLab CI and other systems
@@ -139,6 +204,7 @@ Anywhere else, pass the range yourself (`jevci plan --base origin/main --head HE
 | `jobs.<id>.formatting` | `false` | The job reads comments or formatting (a linter), so comment-only edits still run it. |
 | `jobs.<id>.threshold` | `jev.threshold` | Per-job threshold. |
 | `jobs.<id>.minutes` | none | Typical duration, for `replay` and summaries. |
+| `jobs.<id>.triggers` | `[]` | `{ files, pattern? }` rules for files outside `paths` that the job still reads (a test that scans another package). A change there runs the job when an added or removed line matches `pattern`, or on any change without one. |
 | `full` | `[]` | Globs that run every job. |
 | `ignore` | `[]` | Globs no job reads. Added or edited files are dropped. Deleted or renamed ones still count, since a link may point at them. |
 | `minimumJobs` | `[]` | Jobs that run on any real change. |
@@ -183,7 +249,7 @@ export default defineConfig({
 | `jevci plan` | Prints the plan. `--format text\|json\|markdown\|github\|dotenv`, `--output plan.json`, `--no-jev`, `--base`, `--head`, `--event`, `--labels`. Always exits 0, and a failure inside jevci yields a plan that runs every job. |
 | `jevci check` | Checks that every configured job needs the plan job and reads `needs.<plan>.outputs.jobs`, and that no job is missing from either side. Exits 1 on errors. |
 | `jevci init` | Writes a starting config from the workflow's jobs. |
-| `jevci replay` | Plans the last `--last N` first-parent commits and totals the job minutes saved. `--jev` includes Jev, capped by `--max-tokens`. |
+| `jevci replay` | Plans the last `--last N` first-parent commits and totals the job minutes saved. Commits the workflow's own `push` path filter never runs on are listed but left out of the totals. `--jev` includes Jev, capped by `--max-tokens`. |
 | `jevci eval` | Scores the judge on labelled cases (`{"id", "file", "diff", "evidence"?, "expect": {"<job>": true}}` per line) at several thresholds. `--answers` records answers for offline re-runs. |
 
 A config error exits 2 with every problem listed.
@@ -220,6 +286,7 @@ const plan = await createPlan(config, {
 
 - The rules are only as good as `paths`. A job that reads files outside its `paths` can be skipped wrongly. Keep a nightly full run (`schedule` does that by default) and use `jevci replay` to check a new config against history.
 - Comment-only detection covers scripts, Vue, JSON, markup and CSS. For other text files, only line endings and trailing whitespace are normalized. A test that reads source files as text can still see a comment change. Give such a job `formatting: true`.
+- A file over 1 MiB is not compared as text: any edit to it runs its jobs.
 - Jev judges one file at a time. A change that only breaks in combination with another file's change still runs the jobs either file needs on its own.
 
 ## License

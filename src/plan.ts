@@ -7,8 +7,8 @@
 import type { ResolvedJevciConfig, ResolvedJevOptions } from './config.js';
 import type { ChangedFile, TChangeStatus } from './git.js';
 import type { JevciJudge, JudgeCase } from './judge.js';
-import { collectEvidence } from './evidence.js';
-import { changedFiles, commitMessages, fileDiff, JevciRangeError, resolveRange, textsAt } from './git.js';
+import { evidenceFrom, removedTexts } from './evidence.js';
+import { changedFiles, commitMessages, fileDiff, filesContainingEach, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange, textsAt } from './git.js';
 import { matchesAny } from './glob.js';
 import { judgeCases, judgeTokens } from './judge.js';
 import { normalize } from './normalize.js';
@@ -42,6 +42,8 @@ export interface FilePlan {
     jev?: Record<string, number>;
     /** Why the judge was not asked about this file. */
     note?: string;
+    /** Jobs outside whose paths this file lies that it runs through a trigger. */
+    triggered?: string[];
 }
 
 export interface JobPlan {
@@ -125,7 +127,46 @@ function classifyEdit(config: ResolvedJevciConfig, entry: Pick<FilePlan, 'path' 
     return { ...entry, verdict: 'substantive', jobs, runs: direct, candidates: jobs.filter(id => !direct.includes(id)) };
 }
 
+/** Lines on one side and not the other: what an edit added or removed, order ignored. */
+function changedLines(before: string | undefined, after: string | undefined): string[] {
+    const old = new Set((before ?? '').split('\n'));
+    const next = new Set((after ?? '').split('\n'));
+    return [...[...old].filter(line => !next.has(line)), ...[...next].filter(line => !old.has(line))];
+}
+
+/** The trigger-matching side texts of a change; `undefined` when a side that exists could not be read. */
+function triggerSides(range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): [string | undefined, string | undefined] | undefined {
+    const before = file.status === 'added' ? '' : texts.get(`${range.base}:${file.oldPath ?? file.path}`);
+    const after = file.status === 'deleted' ? '' : texts.get(`${range.head}:${file.path}`);
+    return file.binary || before === undefined || after === undefined ? undefined : [before, after];
+}
+
+/** Jobs a trigger runs for this file: its files match and a changed line matches its pattern (an unreadable change always matches). */
+function triggeredJobs(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>, skip: readonly string[]): string[] {
+    const paths = file.oldPath ? [file.path, file.oldPath] : [file.path];
+    const hit = (trigger: ResolvedJevciConfig['jobs'][string]['triggers'][number]): boolean => {
+        if (!paths.some(path => matchesAny(trigger.files, path))) { return false; }
+        if (!trigger.pattern) { return true; }
+        const sides = triggerSides(range, file, texts);
+        return !sides || changedLines(...sides).some(line => trigger.pattern!.test(line));
+    };
+    return Object.entries(config.jobs).filter(([id, job]) => !skip.includes(id) && job.triggers.some(hit)).map(([id]) => id);
+}
+
 function classify(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): Classified {
+    const classified = classifyPaths(config, range, file, texts);
+    const triggered = triggeredJobs(config, range, file, texts, classified.runs);
+    if (!triggered.length) { return classified; }
+    return {
+        ...classified,
+        jobs: [...new Set([...classified.jobs, ...triggered])],
+        runs: [...classified.runs, ...triggered],
+        candidates: classified.candidates.filter(id => !triggered.includes(id)),
+        triggered,
+    };
+}
+
+function classifyPaths(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): Classified {
     const paths = file.oldPath ? [file.path, file.oldPath] : [file.path];
     const entry = { path: file.path, ...(file.oldPath ? { oldPath: file.oldPath } : {}), status: file.status };
     const moved = file.status === 'deleted' || file.status === 'renamed';
@@ -136,7 +177,8 @@ function classify(config: ResolvedJevciConfig, range: Range, file: ChangedFile, 
     if (jobs.length === 0) { return { ...entry, verdict: 'unclaimed', jobs, runs: [], candidates: [] }; }
     const before = texts.get(`${range.base}:${file.path}`);
     const after = texts.get(`${range.head}:${file.path}`);
-    if (file.binary || file.status !== 'modified' || before === undefined || after === undefined) { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [] }; }
+    if (file.binary || file.status !== 'modified') { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [] }; }
+    if (before === undefined || after === undefined) { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [], note: `is not compared as text (over ${MAX_TEXT_BYTES / (1 << 20)} MiB, or unreadable)` }; }
     return classifyEdit(config, entry, jobs, before, after);
 }
 
@@ -159,18 +201,23 @@ function keepCandidates(files: readonly Classified[], note: string): string {
 }
 
 /** One judge case per file; a file whose diff is over the limit keeps its jobs instead. */
-function judgeInputs(config: ResolvedJevciConfig, jev: ResolvedJevOptions, range: Range, pending: readonly Classified[]): Array<{ file: Classified; input: JudgeCase }> {
-    const cases: Array<{ file: Classified; input: JudgeCase }> = [];
+async function judgeInputs(config: ResolvedJevciConfig, jev: ResolvedJevOptions, range: Range, pending: readonly Classified[]): Promise<Array<{ file: Classified; input: JudgeCase }>> {
+    const judged: Array<{ file: Classified; diff: string }> = [];
     for (const file of pending) {
         const diff = fileDiff(config.root, range.base, range.head, file);
         if (diff.length > jev.maxDiffChars) {
             keepCandidates([file], `diff of ${diff.length} characters, over jev.maxDiffChars (${jev.maxDiffChars})`);
             continue;
         }
-        const jobs = Object.fromEntries(file.candidates.map(id => [id, config.jobs[id]!.checks]));
-        cases.push({ file, input: { file: file.path, diff, evidence: collectEvidence(config.root, range.head, diff, jev.testFiles), jobs, context: jev.context } });
+        judged.push({ file, diff });
     }
-    return cases;
+    // Every judged diff's removed text, deduplicated, searched in parallel.
+    const texts = jev.testFiles.length ? judged.flatMap(({ diff }) => removedTexts(diff)) : [];
+    const hits = await filesContainingEach(config.root, range.head, texts, jev.testFiles, jev.concurrency);
+    return judged.map(({ file, diff }) => {
+        const jobs = Object.fromEntries(file.candidates.map(id => [id, config.jobs[id]!.checks]));
+        return { file, input: { file: file.path, diff, evidence: evidenceFrom(diff, hits), jobs, context: jev.context } };
+    });
 }
 
 /** Records each answer; a job whose P reaches its threshold runs. A missing or malformed answer counts as "can fail". */
@@ -189,7 +236,8 @@ async function applyJudge(config: ResolvedJevciConfig, jev: ResolvedJevOptions, 
     const pending = files.filter(file => file.candidates.length > 0);
     if (pending.length === 0) { return undefined; }
     if (pending.length > jev.maxFiles) { return keepCandidates(pending, `${pending.length} files to judge, over jev.maxFiles (${jev.maxFiles})`); }
-    const cases = judgeInputs(config, jev, range, pending);
+    prefetchBlobs(config.root, range.head, jev.testFiles);
+    const cases = await judgeInputs(config, jev, range, pending);
     const tokens = cases.reduce((sum, { input }) => sum + judgeTokens(input), 0);
     if (tokens > jev.maxTokens) { return keepCandidates(pending, `about ${tokens} tokens to judge, over jev.maxTokens (${jev.maxTokens})`); }
     try {
@@ -202,6 +250,7 @@ async function applyJudge(config: ResolvedJevciConfig, jev: ResolvedJevOptions, 
 }
 
 function runReason(config: ResolvedJevciConfig, id: string, runner: Classified): string {
+    if (runner.triggered?.includes(id)) { return `${runner.path} matches one of the job's triggers`; }
     const probability = runner.jev?.[id];
     if (runner.verdict === 'structural') { return runner.note ? `${runner.path} ${runner.note}` : `${runner.path} was ${runner.status}`; }
     if (runner.verdict === 'noop') { return `${runner.path} changed only comments or formatting, which the job reads`; }
@@ -260,8 +309,15 @@ function planRange(config: ResolvedJevciConfig, input: PlanInput): Range | { err
 /** Every changed file, classified; both sides of each plain edit are read in one git call. */
 function classifyAll(config: ResolvedJevciConfig, range: Range): Classified[] {
     const changed = changedFiles(config.root, range.base, range.head);
-    const edited = config.noop ? changed.filter(file => file.status === 'modified' && !file.binary) : [];
-    const texts = textsAt(config.root, edited.flatMap(file => [`${range.base}:${file.path}`, `${range.head}:${file.path}`]));
+    const edited = changed.filter(file => file.status === 'modified' && !file.binary);
+    const triggerFiles = Object.values(config.jobs).flatMap(job => job.triggers.flatMap(trigger => trigger.files));
+    const watched = triggerFiles.length ? changed.filter(file => !file.binary && [file.path, file.oldPath].some(path => path && matchesAny(triggerFiles, path))) : [];
+    const specs = new Set(edited.flatMap(file => [`${range.base}:${file.path}`, `${range.head}:${file.path}`]));
+    for (const file of watched) {
+        if (file.status !== 'added') { specs.add(`${range.base}:${file.oldPath ?? file.path}`); }
+        if (file.status !== 'deleted') { specs.add(`${range.head}:${file.path}`); }
+    }
+    const texts = textsAt(config.root, [...specs]);
     return changed.map(file => classify(config, range, file, texts));
 }
 
