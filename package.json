@@ -1,0 +1,65 @@
+{
+    "name": "@hazymoon/jevci",
+    "type": "module",
+    "version": "0.1.0",
+    "description": "Decides which CI jobs a commit or pull request actually needs: deterministic path and comment-only rules first, TypeSafe's Jev for the ambiguous rest, so a typo fix does not pay for the whole pipeline.",
+    "author": "Ice-Hazymoon",
+    "license": "MIT",
+    "homepage": "https://github.com/Ice-Hazymoon/jevci#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Ice-Hazymoon/jevci.git"
+    },
+    "bugs": {
+        "url": "https://github.com/Ice-Hazymoon/jevci/issues"
+    },
+    "keywords": [
+        "ci",
+        "github-actions",
+        "gitlab-ci",
+        "affected",
+        "selective-ci",
+        "monorepo",
+        "change-detection",
+        "llm",
+        "typesafe",
+        "jev"
+    ],
+    "sideEffects": false,
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.mts",
+            "default": "./dist/index.mjs"
+        },
+        "./package.json": "./package.json"
+    },
+    "types": "./dist/index.d.mts",
+    "bin": {
+        "jevci": "./dist/bin.mjs"
+    },
+    "files": [
+        "CHANGELOG.md",
+        "README.md",
+        "dist"
+    ],
+    "engines": {
+        "node": ">=22"
+    },
+    "scripts": {
+        "build": "tsdown",
+        "typecheck": "tsc --noEmit",
+        "prepublishOnly": "npm run typecheck && npm run build"
+    },
+    "dependencies": {
+        "jiti": "^2.7.0",
+        "typescript": "^6.0.3",
+        "yaml": "^2.9.1"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.2",
+        "tsdown": "^0.23.0"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}

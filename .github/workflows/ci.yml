@@ -1,0 +1,118 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    node:
+        name: Node ${{ matrix.node }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                node: [22, 24]
+        steps:
+            -   uses: actions/checkout@v4
+            -   uses: actions/setup-node@v4
+                with:
+                    node-version: ${{ matrix.node }}
+            -   run: npm ci --no-audit --no-fund
+            -   run: npm run typecheck
+            -   run: npm run build
+            -   run: npm pack --dry-run
+
+    smoke:
+        name: Installed package
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v4
+            -   uses: actions/setup-node@v4
+                with:
+                    node-version: 22
+            -   run: npm ci --no-audit --no-fund
+            -   run: npm run build
+            -   run: npm pack
+            # Offline and without a key, so the rules alone decide. The GitHub variables are cleared so each plan
+            # reads the throwaway repository's commits instead of this workflow's event.
+            -   name: Plan commits in a throwaway repository
+                run: |
+                    set -euo pipefail
+                    tarball=$(ls "$GITHUB_WORKSPACE"/hazymoon-jevci-*.tgz)
+                    jevci() { env -u GITHUB_ACTIONS -u GITHUB_EVENT_NAME -u GITHUB_EVENT_PATH -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY npx --no-install jevci "$@"; }
+                    runs() { jevci plan --no-jev --format json | node -e 'const p = JSON.parse(require("fs").readFileSync(0, "utf8")); console.log(p.level, Object.keys(p.jobs).filter(id => p.jobs[id].run).join(",") || "-")'; }
+                    expect() { local got; got=$(runs); echo "$1: $got"; test "$got" = "$2"; }
+
+                    mkdir "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+                    git init -q -b main && git config user.email ci@example.com && git config user.name ci
+                    npm init -y > /dev/null
+                    # A project on TypeScript 7, which has no parser API: jevci must use its own TypeScript 6.
+                    npm install --no-audit --no-fund "$tarball" typescript@7 > /dev/null
+                    printf 'node_modules/\n' > .gitignore
+                    mkdir -p .github/workflows src tests docs
+                    printf 'on: [push]\njobs:\n  lint: { runs-on: ubuntu-latest, steps: [{ run: npm run lint }] }\n  test: { runs-on: ubuntu-latest, steps: [{ run: npm test }] }\n' > .github/workflows/ci.yml
+                    printf 'export function add(a: number, b: number) {\n    return a + b;\n}\n' > src/math.ts
+                    printf '# Guide\n' > docs/guide.md
+
+                    jevci --version
+                    jevci init
+                    grep -q "'test': {" jevci.config.ts
+                    set +e; jevci check; code=$?; set -e
+                    test "$code" -eq 1 # the workflow has no plan job yet
+
+                    cat > jevci.config.ts <<'CFG'
+                    import { defineConfig } from '@hazymoon/jevci';
+
+                    export default defineConfig({
+                        full: ['package.json', 'package-lock.json', '.github/**', 'jevci.config.ts'],
+                        ignore: ['docs/**', '**/*.md'],
+                        minimumJobs: ['lint'],
+                        jobs: {
+                            lint: { checks: 'ESLint over src and tests.', downgrade: false, formatting: true },
+                            test: { checks: 'Node test runner over tests/, which imports src/.', paths: ['src/**', 'tests/**'], owns: ['tests/**'] },
+                        },
+                    });
+                    CFG
+                    git add -A && git commit -qm init
+
+                    printf '# Guide\n\nMore words.\n' > docs/guide.md && git commit -qam docs
+                    expect "docs only" "none -"
+                    printf 'export function add(a: number, b: number) {\n    // Sum.\n    return a + b;\n}\n' > src/math.ts && git commit -qam comment
+                    expect "comment only" "partial lint"
+                    printf 'export function add(a: number, b: number) {\n    return a + b + 0;\n}\n' > src/math.ts && git commit -qam logic
+                    expect "code, no judge" "full lint,test"
+                    printf 'export const answer = 42;\n' > src/answer.ts && git add -A && git commit -qm "new file [ci full]"
+                    expect "marker" "full lint,test"
+                    jevci plan --no-jev --format dotenv | grep -qx "JEVCI_RUN_TEST=true"
+
+    bun:
+        name: Bun
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v4
+            -   uses: oven-sh/setup-bun@v2
+            -   run: bun install
+            -   run: bun run typecheck
+            -   run: bun run build
+            -   run: npm pack
+            -   name: CLI on the Bun runtime
+                run: |
+                    set -euo pipefail
+                    mkdir "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+                    git init -q -b main && git config user.email ci@example.com && git config user.name ci
+                    echo '{ "name": "smoke", "private": true }' > package.json
+                    printf 'node_modules/\n' > .gitignore
+                    bun add "$GITHUB_WORKSPACE"/hazymoon-jevci-*.tgz typescript@7
+                    mkdir -p .github/workflows
+                    printf 'on: [push]\njobs:\n  lint: { runs-on: ubuntu-latest, steps: [{ run: bun run lint }] }\n  test: { runs-on: ubuntu-latest, steps: [{ run: bun test }] }\n' > .github/workflows/ci.yml
+                    bunx --bun jevci --version
+                    bunx --bun jevci init
+                    git add -A && git commit -qm init
+                    printf 'export const answer = 42;\n' > answer.ts && git add -A && git commit -qm answer
+                    printf '// The answer.\nexport const answer = 42;\n' > answer.ts && git commit -qam comment
+                    env -u GITHUB_ACTIONS bunx --bun jevci plan --no-jev --format dotenv | tee plan.env
+                    grep -qx "JEVCI_LEVEL=partial" plan.env # a comment-only edit runs only lint, which reads formatting
