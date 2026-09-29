@@ -3,9 +3,9 @@ export { DEFAULT_DIRECTIVES, defineConfig, findConfigFile, JevciConfigError, loa
 export type { CiContext, TCiProvider } from './context.js';
 export { detectContext } from './context.js';
 export type { Evidence } from './evidence.js';
-export { collectEvidence, removedTexts } from './evidence.js';
+export { collectEvidence, evidenceFrom, removedTexts } from './evidence.js';
 export type { ChangedFile, TChangeStatus } from './git.js';
-export { changedFiles, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange } from './git.js';
+export { changedFiles, filesContainingEach, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange } from './git.js';
 export { globToRegExp, matchesAny, matchesGlob } from './glob.js';
 export type { JevClient, JevClientOptions } from './jev.js';
 export { createJevClient, JevciKeyError, JevciRequestError } from './jev.js';

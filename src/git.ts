@@ -1,7 +1,7 @@
 /**
  * Read-only git access: the change set between two commits and file contents on either side.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { matchesAny } from './glob.js';
 
 export type TChangeStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'copied' | 'type-changed';
@@ -174,6 +174,30 @@ export function prefetchBlobs(root: string, rev: string, globs: readonly string[
     } catch {
         // `git grep` fetches what is still missing on its own.
     }
+}
+
+/** For each of `texts`, the paths at `rev` matching `globs` that contain it literally, searched `concurrency` at a time. */
+export async function filesContainingEach(root: string, rev: string, texts: readonly string[], globs: readonly string[], concurrency: number = 8): Promise<Map<string, string[]>> {
+    const unique = [...new Set(texts)];
+    const found = new Map<string, string[]>();
+    let next = 0;
+    const worker = async (): Promise<void> => {
+        while (next < unique.length) {
+            const text = unique[next++]!;
+            found.set(text, await grepFiles(root, rev, text, globs));
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, worker));
+    return found;
+}
+
+function grepFiles(root: string, rev: string, text: string, globs: readonly string[]): Promise<string[]> {
+    return new Promise((resolve) => {
+        execFile('git', ['grep', '-l', '-F', '-e', text, rev, '--', ...globs.map(glob => `:(glob)${glob}`)], { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20 }, (err, out) => {
+            // Exit status 1 means no match; any other failure also yields no evidence.
+            resolve(err ? [] : out.split('\n').filter(Boolean).map(line => line.slice(rev.length + 1)));
+        });
+    });
 }
 
 /** Paths at `rev` matching `globs` whose content contains `text` literally. */

@@ -7,8 +7,8 @@
 import type { ResolvedJevciConfig, ResolvedJevOptions } from './config.js';
 import type { ChangedFile, TChangeStatus } from './git.js';
 import type { JevciJudge, JudgeCase } from './judge.js';
-import { collectEvidence } from './evidence.js';
-import { changedFiles, commitMessages, fileDiff, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange, textsAt } from './git.js';
+import { evidenceFrom, removedTexts } from './evidence.js';
+import { changedFiles, commitMessages, fileDiff, filesContainingEach, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange, textsAt } from './git.js';
 import { matchesAny } from './glob.js';
 import { judgeCases, judgeTokens } from './judge.js';
 import { normalize } from './normalize.js';
@@ -160,18 +160,23 @@ function keepCandidates(files: readonly Classified[], note: string): string {
 }
 
 /** One judge case per file; a file whose diff is over the limit keeps its jobs instead. */
-function judgeInputs(config: ResolvedJevciConfig, jev: ResolvedJevOptions, range: Range, pending: readonly Classified[]): Array<{ file: Classified; input: JudgeCase }> {
-    const cases: Array<{ file: Classified; input: JudgeCase }> = [];
+async function judgeInputs(config: ResolvedJevciConfig, jev: ResolvedJevOptions, range: Range, pending: readonly Classified[]): Promise<Array<{ file: Classified; input: JudgeCase }>> {
+    const judged: Array<{ file: Classified; diff: string }> = [];
     for (const file of pending) {
         const diff = fileDiff(config.root, range.base, range.head, file);
         if (diff.length > jev.maxDiffChars) {
             keepCandidates([file], `diff of ${diff.length} characters, over jev.maxDiffChars (${jev.maxDiffChars})`);
             continue;
         }
-        const jobs = Object.fromEntries(file.candidates.map(id => [id, config.jobs[id]!.checks]));
-        cases.push({ file, input: { file: file.path, diff, evidence: collectEvidence(config.root, range.head, diff, jev.testFiles), jobs, context: jev.context } });
+        judged.push({ file, diff });
     }
-    return cases;
+    // Every judged diff's removed text, deduplicated, searched in parallel.
+    const texts = jev.testFiles.length ? judged.flatMap(({ diff }) => removedTexts(diff)) : [];
+    const hits = await filesContainingEach(config.root, range.head, texts, jev.testFiles, jev.concurrency);
+    return judged.map(({ file, diff }) => {
+        const jobs = Object.fromEntries(file.candidates.map(id => [id, config.jobs[id]!.checks]));
+        return { file, input: { file: file.path, diff, evidence: evidenceFrom(diff, hits), jobs, context: jev.context } };
+    });
 }
 
 /** Records each answer; a job whose P reaches its threshold runs. A missing or malformed answer counts as "can fail". */
@@ -191,7 +196,7 @@ async function applyJudge(config: ResolvedJevciConfig, jev: ResolvedJevOptions, 
     if (pending.length === 0) { return undefined; }
     if (pending.length > jev.maxFiles) { return keepCandidates(pending, `${pending.length} files to judge, over jev.maxFiles (${jev.maxFiles})`); }
     prefetchBlobs(config.root, range.head, jev.testFiles);
-    const cases = judgeInputs(config, jev, range, pending);
+    const cases = await judgeInputs(config, jev, range, pending);
     const tokens = cases.reduce((sum, { input }) => sum + judgeTokens(input), 0);
     if (tokens > jev.maxTokens) { return keepCandidates(pending, `about ${tokens} tokens to judge, over jev.maxTokens (${jev.maxTokens})`); }
     try {

@@ -6,6 +6,7 @@
 - `workspacePaths(packages)` and `readWorkspace()` build job paths from the workspace dependency graph (pnpm, npm, Yarn, Bun), so a job's paths follow its packages' dependencies.
 - `jevci replay` leaves out commits the workflow's `push` path filter never runs on, instead of counting them as skipped CI.
 - Large changes no longer crash the plan: files over 1 MiB are not read as text (their edits count as structural), and file contents are read in bounded batches.
+- Evidence is gathered once per plan: removed text is deduplicated across files and the test files are searched in parallel (`jev.concurrency`). On a 65-package monorepo this cut planning time 3.2x (p90 19 s to 5 s) with byte-identical Jev requests.
 - In a partial clone (`filter: blob:none`), the test files searched for evidence are fetched in one request instead of one request each.
 - Fix: with `noop: false`, every edit counted as structural, so Jev was never asked.
 
