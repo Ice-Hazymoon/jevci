@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Matrix jobs: config jobs named `<job>/<entry>` form a group, and the plan writes one output per group with the entries that run, for a matrix built with `fromJSON`. `jevci check` verifies the guard, the matrix, its fallback list and the plan job's outputs.
+- `workspacePaths(packages)` and `readWorkspace()` build job paths from the workspace dependency graph (pnpm, npm, Yarn, Bun), so a job's paths follow its packages' dependencies.
+- `jevci replay` leaves out commits the workflow's `push` path filter never runs on, instead of counting them as skipped CI.
+- Large changes no longer crash the plan: files over 1 MiB are not read as text (their edits count as structural), and file contents are read in bounded batches.
+- In a partial clone (`filter: blob:none`), the test files searched for evidence are fetched in one request instead of one request each.
+- Fix: with `noop: false`, every edit counted as structural, so Jev was never asked.
+
 ## 0.1.0
 
 First release.

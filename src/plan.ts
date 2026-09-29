@@ -8,7 +8,7 @@ import type { ResolvedJevciConfig, ResolvedJevOptions } from './config.js';
 import type { ChangedFile, TChangeStatus } from './git.js';
 import type { JevciJudge, JudgeCase } from './judge.js';
 import { collectEvidence } from './evidence.js';
-import { changedFiles, commitMessages, fileDiff, JevciRangeError, resolveRange, textsAt } from './git.js';
+import { changedFiles, commitMessages, fileDiff, JevciRangeError, MAX_TEXT_BYTES, prefetchBlobs, resolveRange, textsAt } from './git.js';
 import { matchesAny } from './glob.js';
 import { judgeCases, judgeTokens } from './judge.js';
 import { normalize } from './normalize.js';
@@ -136,7 +136,8 @@ function classify(config: ResolvedJevciConfig, range: Range, file: ChangedFile, 
     if (jobs.length === 0) { return { ...entry, verdict: 'unclaimed', jobs, runs: [], candidates: [] }; }
     const before = texts.get(`${range.base}:${file.path}`);
     const after = texts.get(`${range.head}:${file.path}`);
-    if (file.binary || file.status !== 'modified' || before === undefined || after === undefined) { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [] }; }
+    if (file.binary || file.status !== 'modified') { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [] }; }
+    if (before === undefined || after === undefined) { return { ...entry, verdict: 'structural', jobs, runs: [...jobs], candidates: [], note: `is not compared as text (over ${MAX_TEXT_BYTES / (1 << 20)} MiB, or unreadable)` }; }
     return classifyEdit(config, entry, jobs, before, after);
 }
 
@@ -189,6 +190,7 @@ async function applyJudge(config: ResolvedJevciConfig, jev: ResolvedJevOptions, 
     const pending = files.filter(file => file.candidates.length > 0);
     if (pending.length === 0) { return undefined; }
     if (pending.length > jev.maxFiles) { return keepCandidates(pending, `${pending.length} files to judge, over jev.maxFiles (${jev.maxFiles})`); }
+    prefetchBlobs(config.root, range.head, jev.testFiles);
     const cases = judgeInputs(config, jev, range, pending);
     const tokens = cases.reduce((sum, { input }) => sum + judgeTokens(input), 0);
     if (tokens > jev.maxTokens) { return keepCandidates(pending, `about ${tokens} tokens to judge, over jev.maxTokens (${jev.maxTokens})`); }
@@ -260,7 +262,7 @@ function planRange(config: ResolvedJevciConfig, input: PlanInput): Range | { err
 /** Every changed file, classified; both sides of each plain edit are read in one git call. */
 function classifyAll(config: ResolvedJevciConfig, range: Range): Classified[] {
     const changed = changedFiles(config.root, range.base, range.head);
-    const edited = config.noop ? changed.filter(file => file.status === 'modified' && !file.binary) : [];
+    const edited = changed.filter(file => file.status === 'modified' && !file.binary);
     const texts = textsAt(config.root, edited.flatMap(file => [`${range.base}:${file.path}`, `${range.head}:${file.path}`]));
     return changed.map(file => classify(config, range, file, texts));
 }

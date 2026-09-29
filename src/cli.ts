@@ -8,6 +8,7 @@ import type { Evidence } from './evidence.js';
 import type { JevciJudge, JudgeCase } from './judge.js';
 import type { Plan, PlanInput, TPlanLevel } from './plan.js';
 import type { TReportFormat } from './report.js';
+import type { PathFilter } from './workflow.js';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -19,7 +20,7 @@ import { createJevJudge, judgeCases } from './judge.js';
 import { createPlan, fullPlan } from './plan.js';
 import { formatPlan, REPORT_FORMATS, writeGithub } from './report.js';
 import { removedExports } from './surface.js';
-import { checkWorkflow, draftConfig, findWorkflow, readWorkflow, workflowSnippet } from './workflow.js';
+import { checkWorkflow, draftConfig, findWorkflow, readPathFilter, readWorkflow, triggersWorkflow, workflowSnippet } from './workflow.js';
 
 interface OptionSpec { name: string; value?: string; help: string }
 interface CommandSpec { usage: string; summary: string; details?: string; options: readonly OptionSpec[] }
@@ -197,18 +198,24 @@ function init(options: Options): number {
     return 0;
 }
 
-interface ReplayRow { commit: string; subject: string; plan: Plan }
+/** `plan` is absent when the workflow's own path filter would not have run on the commit. */
+interface ReplayRow { commit: string; subject: string; plan?: Plan }
 
 interface ReplayTotals { levels: Record<TPlanLevel, number>; skipped: Record<string, number>; planned: number; full: number }
 
-async function replayRows(config: ResolvedJevciConfig, last: number, judge: JevciJudge | undefined, maxTokens: number): Promise<ReplayRow[]> {
+async function replayRows(config: ResolvedJevciConfig, last: number, judge: JevciJudge | undefined, maxTokens: number, filter: PathFilter | undefined): Promise<ReplayRow[]> {
     const rows: ReplayRow[] = [];
     for (const commit of git(config.root, ['rev-list', '--first-parent', `--max-count=${last}`, 'HEAD']).split('\n').filter(Boolean)) {
         const parent = git(config.root, ['rev-list', '--parents', '-n', '1', commit]).trim().split(' ')[1];
         if (!parent) { continue; }
+        const subject = git(config.root, ['log', '-1', '--format=%s', commit]).trim();
+        if (filter && !triggersWorkflow(filter, git(config.root, ['diff', '--name-only', '--no-renames', parent, commit]).split('\n').filter(Boolean))) {
+            rows.push({ commit, subject });
+            continue;
+        }
         const withinBudget = (judge?.stats?.inputTokens ?? 0) < maxTokens ? judge : undefined;
         const result = await createPlan(config, { base: parent, head: commit, event: 'push', judge: withinBudget });
-        rows.push({ commit, subject: git(config.root, ['log', '-1', '--format=%s', commit]).trim(), plan: result });
+        rows.push({ commit, subject, plan: result });
     }
     return rows;
 }
@@ -216,6 +223,7 @@ async function replayRows(config: ResolvedJevciConfig, last: number, judge: Jevc
 function tally(config: ResolvedJevciConfig, rows: readonly ReplayRow[]): ReplayTotals {
     const totals: ReplayTotals = { levels: { none: 0, partial: 0, full: 0 }, skipped: Object.fromEntries(Object.keys(config.jobs).map(id => [id, 0])), planned: 0, full: 0 };
     for (const { plan: result } of rows) {
+        if (!result) { continue; }
         totals.levels[result.level]++;
         totals.planned += result.minutes.planned;
         totals.full += result.minutes.full;
@@ -226,6 +234,7 @@ function tally(config: ResolvedJevciConfig, rows: readonly ReplayRow[]): ReplayT
 }
 
 function replayLine({ commit, subject, plan: result }: ReplayRow, withMinutes: boolean): string {
+    if (!result) { return `${commit.slice(0, 9)}  ${'filtered'.padEnd(7)}  ${withMinutes ? '    -   ' : ''}${subject.slice(0, 72)}`; }
     const skips = Object.entries(result.jobs).filter(([, job]) => !job.run).map(([id]) => id);
     const minutes = withMinutes ? `${result.minutes.planned.toFixed(1).padStart(5)}m  ` : '';
     const skipped = result.level === 'partial' ? `  [skip ${skips.join(', ')}]` : '';
@@ -241,14 +250,18 @@ async function replay(options: Options): Promise<number> {
     const config = await loadConfig(text(options, 'config'));
     const { judge, unavailable } = options.jev ? tryJudge(config) : {};
     if (options.jev && !judge) { throw new JevciConfigError(`--jev needs a Jev provider: ${unavailable}`); }
-    const rows = await replayRows(config, positiveNumber(options, 'last', 50), judge, positiveNumber(options, 'max-tokens', 300_000));
+    const workflow = findWorkflow(config.root);
+    const filter = workflow ? readPathFilter(workflow, 'push') : undefined;
+    const rows = await replayRows(config, positiveNumber(options, 'last', 50), judge, positiveNumber(options, 'max-tokens', 300_000), filter);
+    const filtered = rows.filter(row => !row.plan).length;
     const totals = tally(config, rows);
     if (text(options, 'format') === 'json') {
-        console.log(JSON.stringify({ commits: rows.length, ...totals, judge: judge?.stats, rows }, null, 2));
+        console.log(JSON.stringify({ commits: rows.length, filtered, ...totals, judge: judge?.stats, rows }, null, 2));
         return 0;
     }
     console.log(rows.map(row => replayLine(row, totals.full > 0)).join('\n'));
-    console.log(`\n${rows.length} commits: ${totals.levels.none} skip everything, ${totals.levels.partial} partial, ${totals.levels.full} full`);
+    const skippedByWorkflow = filtered ? `; ${filtered} more never run the workflow (its push path filter), so they are left out of the totals` : '';
+    console.log(`\n${rows.length - filtered} commits: ${totals.levels.none} skip everything, ${totals.levels.partial} partial, ${totals.levels.full} full${skippedByWorkflow}`);
     if (totals.full) { console.log(`job minutes: ${totals.planned.toFixed(0)} of ${totals.full.toFixed(0)} (${(100 - totals.planned / totals.full * 100).toFixed(0)}% saved)`); }
     console.log(`times skipped: ${Object.entries(totals.skipped).map(([id, count]) => `${id} ${count}`).join(', ')}`);
     if (judge) { console.log(judgeUsage(judge)); }

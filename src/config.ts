@@ -144,7 +144,9 @@ export interface ResolvedJevciConfig {
 export const DEFAULT_DIRECTIVES = /@ts-(?:expect-error|ignore|nocheck|check)|eslint|prettier-ignore|biome-ignore|istanbul|[cv]8 ignore|#__PURE__|@__PURE__|@__NO_SIDE_EFFECTS__|webpack[A-Z]|@vite-ignore|<reference|@jsx|@vitest-environment|@jest-environment|sourceMappingURL|@deprecated|@type\b|@typedef|@template|@satisfies|@param\s*\{|@returns?\s*\{/;
 
 const CONFIG_FILE_NAMES = ['jevci.config.ts', 'jevci.config.mts', 'jevci.config.js', 'jevci.config.mjs'];
-const JOB_ID = /^[\w-]+$/;
+const JOB_ID = /^[\w-]+(?:\/[\w-]+)?$/;
+/** Plan outputs a matrix group may not be named after. */
+const RESERVED_OUTPUTS = new Set(['level', 'jobs', 'reason', 'fallback']);
 
 /** The config is malformed; the message names every problem. */
 export class JevciConfigError extends Error {
@@ -219,7 +221,10 @@ function fieldProblems(value: Record<string, unknown>, fields: Record<string, Fi
 
 function jobProblems(id: string, job: unknown): string[] {
     const where = `jobs["${id}"]`;
-    const badId = JOB_ID.test(id) ? [] : [`${where}: a job id may contain letters, digits, "-" and "_" only (it becomes an output key).`];
+    const group = id.includes('/') ? id.slice(0, id.indexOf('/')) : undefined;
+    const badId = !JOB_ID.test(id)
+        ? [`${where}: a job id may contain letters, digits, "-" and "_", plus one "/" between a matrix job and its entry (it becomes an output key).`]
+        : group && RESERVED_OUTPUTS.has(group) ? [`${where}: "${group}" is a plan output of its own, so it cannot name a matrix group.`] : [];
     return [...badId, ...(isObject(job) ? fieldProblems(job, JOB_FIELDS, where, ['checks']) : [`${where} must be an object.`])];
 }
 
@@ -228,6 +233,8 @@ function problems(config: unknown): string[] {
     const found = fieldProblems(config, CONFIG_FIELDS, 'config', ['jobs']);
     const jobs = isObject(config.jobs) ? config.jobs : {};
     found.push(...Object.entries(jobs).flatMap(([id, job]) => jobProblems(id, job)));
+    const groups = new Set(Object.keys(jobs).filter(id => id.includes('/')).map(id => id.slice(0, id.indexOf('/'))));
+    found.push(...[...groups].filter(group => group in jobs).map(group => `jobs["${group}"]: "${group}" is also a matrix group ("${group}/…"); a workflow job is either one job or a matrix.`));
     const minimum = isStringList(config.minimumJobs) ? config.minimumJobs : [];
     found.push(...minimum.filter(id => !(id in jobs)).map(id => `config.minimumJobs names unknown job "${id}".`));
     const sections: Array<[unknown, Record<string, Field>, string]> = [[config.force, FORCE_FIELDS, 'force'], [config.noop, NOOP_FIELDS, 'noop'], [config.jev, JEV_FIELDS, 'jev']];
