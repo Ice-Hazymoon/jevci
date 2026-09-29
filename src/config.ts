@@ -25,6 +25,18 @@ export interface JevciJob {
     threshold?: number;
     /** Typical duration in minutes, for savings reports. */
     minutes?: number;
+    /**
+     * Files outside `paths` that the job still reads, such as a test that scans another package's source.
+     * A change to one runs the job when an added or removed line matches `pattern` (any change without one),
+     * without asking Jev.
+     */
+    triggers?: readonly JevciTrigger[];
+}
+
+/** A content rule: a change to `files` whose changed lines match `pattern` runs the job. */
+export interface JevciTrigger {
+    files: readonly string[];
+    pattern?: RegExp;
 }
 
 /** Normalizes one file type for comment- and format-only change detection. */
@@ -113,6 +125,7 @@ export interface ResolvedJevciJob {
     formatting: boolean;
     threshold?: number;
     minutes?: number;
+    triggers: readonly JevciTrigger[];
 }
 
 export interface ResolvedJevOptions {
@@ -187,6 +200,10 @@ const JOB_FIELDS: Record<string, Field> = {
     formatting: BOOLEAN,
     threshold: PROBABILITY,
     minutes: POSITIVE,
+    triggers: {
+        valid: value => Array.isArray(value) && value.every(item => isObject(item) && isStringList(item.files) && (item.pattern === undefined || item.pattern instanceof RegExp) && Object.keys(item).every(key => key === 'files' || key === 'pattern')),
+        expected: 'an array of { files: string[], pattern?: RegExp }',
+    },
 };
 const FORCE_FIELDS: Record<string, Field> = { markers: STRINGS, labels: STRINGS, events: STRINGS };
 const NOOP_FIELDS: Record<string, Field> = {
@@ -280,6 +297,8 @@ function resolveJob(job: JevciJob): ResolvedJevciJob {
         formatting: job.formatting ?? false,
         threshold: job.threshold,
         minutes: job.minutes,
+        // A global or sticky RegExp keeps state between `test` calls.
+        triggers: (job.triggers ?? []).map(trigger => ({ files: trigger.files, ...(trigger.pattern ? { pattern: new RegExp(trigger.pattern.source, trigger.pattern.flags.replace(/[gy]/g, '')) } : {}) })),
     };
 }
 

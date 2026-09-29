@@ -1,4 +1,4 @@
-export type { JevciConfig, JevciJevOptions, JevciJob, JevciNormalizer, JevciProvider, ResolvedJevciConfig, ResolvedJevciJob, ResolvedJevOptions } from './config.js';
+export type { JevciConfig, JevciJevOptions, JevciJob, JevciNormalizer, JevciProvider, JevciTrigger, ResolvedJevciConfig, ResolvedJevciJob, ResolvedJevOptions } from './config.js';
 export { DEFAULT_DIRECTIVES, defineConfig, findConfigFile, JevciConfigError, loadConfig, resolveConfig } from './config.js';
 export type { CiContext, TCiProvider } from './context.js';
 export { detectContext } from './context.js';

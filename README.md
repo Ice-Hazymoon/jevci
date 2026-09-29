@@ -159,7 +159,18 @@ export default defineConfig({
 });
 ```
 
-Names may be globs (`@acme/*`); a name that matches no package is a config error, so a renamed package cannot silently empty a job's paths. The result covers the packages' directories only: add the root files the job reads (its CI config, shared tsconfig, files its tests open by path) yourself, or put them in `full`.
+Names may be globs (`@acme/*`, or `**` for every package); a name that matches no package is a config error, so a renamed package cannot silently empty a job's paths. The result covers the packages' directories only: add the root files the job reads (its CI config, shared tsconfig, files its tests open by path) yourself, or put them in `full`.
+
+A test that reads another package's files by path is invisible to the dependency graph. When it reads only part of what changes there, a trigger keeps the job from running on every edit:
+
+```ts
+'test/admin-api': {
+    checks: '...',
+    paths: workspacePaths(['@acme/admin-api'], { workspace }),
+    // Its parity test counts which procedures the front end calls.
+    triggers: [{ files: ['apps/front/src/**'], pattern: /\b(api|queries)\.[\w.]+\(/ }],
+},
+```
 
 ## GitLab CI and other systems
 
@@ -193,6 +204,7 @@ Anywhere else, pass the range yourself (`jevci plan --base origin/main --head HE
 | `jobs.<id>.formatting` | `false` | The job reads comments or formatting (a linter), so comment-only edits still run it. |
 | `jobs.<id>.threshold` | `jev.threshold` | Per-job threshold. |
 | `jobs.<id>.minutes` | none | Typical duration, for `replay` and summaries. |
+| `jobs.<id>.triggers` | `[]` | `{ files, pattern? }` rules for files outside `paths` that the job still reads (a test that scans another package). A change there runs the job when an added or removed line matches `pattern`, or on any change without one. |
 | `full` | `[]` | Globs that run every job. |
 | `ignore` | `[]` | Globs no job reads. Added or edited files are dropped. Deleted or renamed ones still count, since a link may point at them. |
 | `minimumJobs` | `[]` | Jobs that run on any real change. |

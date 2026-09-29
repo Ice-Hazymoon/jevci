@@ -42,6 +42,8 @@ export interface FilePlan {
     jev?: Record<string, number>;
     /** Why the judge was not asked about this file. */
     note?: string;
+    /** Jobs outside whose paths this file lies that it runs through a trigger. */
+    triggered?: string[];
 }
 
 export interface JobPlan {
@@ -125,7 +127,46 @@ function classifyEdit(config: ResolvedJevciConfig, entry: Pick<FilePlan, 'path' 
     return { ...entry, verdict: 'substantive', jobs, runs: direct, candidates: jobs.filter(id => !direct.includes(id)) };
 }
 
+/** Lines on one side and not the other: what an edit added or removed, order ignored. */
+function changedLines(before: string | undefined, after: string | undefined): string[] {
+    const old = new Set((before ?? '').split('\n'));
+    const next = new Set((after ?? '').split('\n'));
+    return [...[...old].filter(line => !next.has(line)), ...[...next].filter(line => !old.has(line))];
+}
+
+/** The trigger-matching side texts of a change; `undefined` when a side that exists could not be read. */
+function triggerSides(range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): [string | undefined, string | undefined] | undefined {
+    const before = file.status === 'added' ? '' : texts.get(`${range.base}:${file.oldPath ?? file.path}`);
+    const after = file.status === 'deleted' ? '' : texts.get(`${range.head}:${file.path}`);
+    return file.binary || before === undefined || after === undefined ? undefined : [before, after];
+}
+
+/** Jobs a trigger runs for this file: its files match and a changed line matches its pattern (an unreadable change always matches). */
+function triggeredJobs(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>, skip: readonly string[]): string[] {
+    const paths = file.oldPath ? [file.path, file.oldPath] : [file.path];
+    const hit = (trigger: ResolvedJevciConfig['jobs'][string]['triggers'][number]): boolean => {
+        if (!paths.some(path => matchesAny(trigger.files, path))) { return false; }
+        if (!trigger.pattern) { return true; }
+        const sides = triggerSides(range, file, texts);
+        return !sides || changedLines(...sides).some(line => trigger.pattern!.test(line));
+    };
+    return Object.entries(config.jobs).filter(([id, job]) => !skip.includes(id) && job.triggers.some(hit)).map(([id]) => id);
+}
+
 function classify(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): Classified {
+    const classified = classifyPaths(config, range, file, texts);
+    const triggered = triggeredJobs(config, range, file, texts, classified.runs);
+    if (!triggered.length) { return classified; }
+    return {
+        ...classified,
+        jobs: [...new Set([...classified.jobs, ...triggered])],
+        runs: [...classified.runs, ...triggered],
+        candidates: classified.candidates.filter(id => !triggered.includes(id)),
+        triggered,
+    };
+}
+
+function classifyPaths(config: ResolvedJevciConfig, range: Range, file: ChangedFile, texts: ReadonlyMap<string, string | undefined>): Classified {
     const paths = file.oldPath ? [file.path, file.oldPath] : [file.path];
     const entry = { path: file.path, ...(file.oldPath ? { oldPath: file.oldPath } : {}), status: file.status };
     const moved = file.status === 'deleted' || file.status === 'renamed';
@@ -209,6 +250,7 @@ async function applyJudge(config: ResolvedJevciConfig, jev: ResolvedJevOptions, 
 }
 
 function runReason(config: ResolvedJevciConfig, id: string, runner: Classified): string {
+    if (runner.triggered?.includes(id)) { return `${runner.path} matches one of the job's triggers`; }
     const probability = runner.jev?.[id];
     if (runner.verdict === 'structural') { return runner.note ? `${runner.path} ${runner.note}` : `${runner.path} was ${runner.status}`; }
     if (runner.verdict === 'noop') { return `${runner.path} changed only comments or formatting, which the job reads`; }
@@ -268,7 +310,14 @@ function planRange(config: ResolvedJevciConfig, input: PlanInput): Range | { err
 function classifyAll(config: ResolvedJevciConfig, range: Range): Classified[] {
     const changed = changedFiles(config.root, range.base, range.head);
     const edited = changed.filter(file => file.status === 'modified' && !file.binary);
-    const texts = textsAt(config.root, edited.flatMap(file => [`${range.base}:${file.path}`, `${range.head}:${file.path}`]));
+    const triggerFiles = Object.values(config.jobs).flatMap(job => job.triggers.flatMap(trigger => trigger.files));
+    const watched = triggerFiles.length ? changed.filter(file => !file.binary && [file.path, file.oldPath].some(path => path && matchesAny(triggerFiles, path))) : [];
+    const specs = new Set(edited.flatMap(file => [`${range.base}:${file.path}`, `${range.head}:${file.path}`]));
+    for (const file of watched) {
+        if (file.status !== 'added') { specs.add(`${range.base}:${file.oldPath ?? file.path}`); }
+        if (file.status !== 'deleted') { specs.add(`${range.head}:${file.path}`); }
+    }
+    const texts = textsAt(config.root, [...specs]);
     return changed.map(file => classify(config, range, file, texts));
 }
 
