@@ -2,7 +2,7 @@
     "name": "@hazymoon/jevci",
     "type": "module",
     "version": "0.1.0",
-    "description": "Decides which CI jobs a commit or pull request actually needs: deterministic path and comment-only rules first, TypeSafe's Jev for the ambiguous rest, so a typo fix does not pay for the whole pipeline.",
+    "description": "Selective CI for GitHub Actions and GitLab CI: runs only the jobs a change can affect, using deterministic rules and an optional model pass.",
     "author": "Ice-Hazymoon",
     "license": "MIT",
     "homepage": "https://github.com/Ice-Hazymoon/jevci#readme",
