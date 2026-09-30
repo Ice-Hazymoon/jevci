@@ -1,37 +1,26 @@
 # jevci
 
-Run the CI jobs a change needs, not the whole pipeline. A typo fix in the docs skips CI, a reworded button label runs the linter, and a change to a type runs the type checker, not the 7-minute build.
+[![CI](https://github.com/Ice-Hazymoon/jevci/actions/workflows/ci.yml/badge.svg)](https://github.com/Ice-Hazymoon/jevci/actions/workflows/ci.yml)
 
-jevci reads the commit range, applies rules you can predict, and only then asks [TypeSafe](https://typesafe.ai)'s Jev model whether a remaining edit could make a job fail. Jev can only remove jobs the rules would otherwise run, and only when it is confident. If jevci fails, times out or has no API key, every job the rules chose runs anyway.
+Selective CI for GitHub Actions and GitLab CI. jevci compares a commit range, decides which CI jobs the change can affect, and skips the rest.
 
-## How a plan is made
+Jobs are selected by deterministic rules: paths, comment-only edits and structural changes. An optional model pass ([TypeSafe](https://typesafe.ai) Jev) can drop a job it is confident the change cannot fail; it never adds jobs or skips CI entirely. If the model pass is unavailable, the rule-based plan is used. If jevci itself fails, every job runs.
 
-For each changed file, in order:
-
-1. **Forced.** A `schedule` or manual run, a `[ci full]` marker in a commit message or pull request body, or a `ci:full` label runs every job. A missing base commit also runs every job (a new branch, a force-push, a shallow clone).
-2. **Paths.** A file matching `full` (lockfiles, CI config, schema) runs every job. A file matching `ignore` (docs) runs nothing. Otherwise the file counts for the jobs whose `paths` include it.
-3. **No-ops.** When a file changed only comments or formatting, only the jobs that read formatting (`formatting: true`, e.g. the linter) run. Scripts are compared as TypeScript syntax trees. Comments that tools read, such as `@ts-expect-error`, `eslint-disable` and `#__PURE__`, count as real changes.
-4. **Structure.** An added, deleted, renamed or binary file runs all of its jobs. So does an edit that removes or renames an export, since that breaks importers a one-file judgement cannot see.
-5. **Jev.** For each remaining edit and each job that may be dropped, Jev estimates P(this change can make the job fail). It sees the diff, the job's `checks` description, and the test files that still contain text the edit removed. A job is dropped for the file when P is below `threshold`.
-
-A job runs if any file needs it, and `minimumJobs` run whenever any real change exists. So skipping CI entirely is always a decision made by the rules.
-
-## Install
+## Installation
 
 ```sh
 npm install --save-dev @hazymoon/jevci
-npx jevci init        # jevci.config.ts from your workflow's jobs, plus the wiring to paste
 ```
 
-This requires Node.js 22+ or Bun. jevci parses scripts with its own TypeScript 6 dependency, so it works whatever TypeScript version the project uses, including TypeScript 7.
+Requires Node.js 22 or later, or Bun. jevci parses scripts with its own TypeScript 6 dependency, independent of the TypeScript version the project uses.
 
-## Quick start
+## Getting started
 
-1. Run `npx jevci init`. It writes `jevci.config.ts` with one entry per job in your GitHub workflow.
-2. Describe each job in `checks`: what it verifies, and what it cannot see. Narrow its `paths`.
-3. Add a `plan` job to the workflow and gate each job on it (see below).
-4. Run `npx jevci check` to confirm that every configured job reads the plan and that no job is missing on either side.
-5. Run `npx jevci replay --last 100` to see what the rules alone would have saved on your recent history. Add `--jev` to include Jev.
+1. `npx jevci init` writes `jevci.config.ts` with one entry per job in your GitHub workflow and prints the workflow changes.
+2. Describe each job in `checks` and narrow its `paths`.
+3. Add the plan job and the job guards to the workflow (see [GitHub Actions](#github-actions)).
+4. `npx jevci check` validates the wiring.
+5. `npx jevci replay --last 100` estimates the savings on recent history. Add `--jev` to include the model pass.
 
 ```ts
 // jevci.config.ts
@@ -64,6 +53,19 @@ export default defineConfig({
 });
 ```
 
+## How jobs are selected
+
+Every job runs for `schedule` and manual events, a `[ci full]` marker in a commit message or pull request description, the `ci:full` label, or a base commit that cannot be resolved (a new branch, a force push, a shallow clone).
+
+Otherwise, each changed file is classified by the first rule that applies:
+
+1. **Paths.** A file matching `full` runs every job. A file matching `ignore` runs none. Any other file applies to the jobs whose `paths` include it.
+2. **Comments and formatting.** If only comments or formatting changed, only jobs with `formatting: true` run. Scripts are compared by syntax tree. Directive comments such as `@ts-expect-error`, `eslint-disable` and `#__PURE__` count as code.
+3. **Structure.** Added, deleted, renamed and binary files run all of their jobs. So do edits that remove or rename an export.
+4. **Model pass.** For each remaining edit and job, Jev estimates the probability that the edit can make the job fail. It is given the diff, the job's `checks`, and the test files that contain text the edit removed. A job is dropped for the file when the probability is below `threshold`. Jobs with `downgrade: false`, and files in a job's `owns`, skip this step.
+
+A job runs if any file requires it. `minimumJobs` run on any change that is not ignored or comment-only, so skipping CI entirely is always a rule-based decision.
+
 ## GitHub Actions
 
 ```yaml
@@ -75,9 +77,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # the plan diffs against the merge base
-          filter: blob:none # full history without every file's content; jevci fetches the blobs it reads in batches
-      # Only jevci is installed; the project's dependencies are not needed to plan.
+          fetch-depth: 0 # diff against the merge base
+          filter: blob:none # fetch file contents on demand
+      # The project's dependencies are not needed to plan.
       - id: plan
         run: npx --yes @hazymoon/jevci plan --format github
         env:
@@ -91,14 +93,21 @@ jobs:
       # ...
 ```
 
-With `--format github`, the plan job:
+The guard also runs the job when the plan job does not succeed. GitHub reports a job skipped by `if:` as successful, so required status checks are not blocked.
 
-- writes the outputs `level` (`none`, `partial` or `full`), `jobs` (a JSON object of job id → boolean), `reason` and `fallback`, plus one output per matrix group (see below);
-- adds a table of jobs and reasons to the run summary.
+With `--format github`, the plan step writes a table of jobs and reasons to the job summary and sets these outputs:
 
-The guard above also runs the job whenever the plan job itself did not succeed. GitHub treats a job skipped by `if:` as passing, so required status checks still pass.
+| Output | Value |
+| --- | --- |
+| `level` | `none`, `partial` or `full` |
+| `jobs` | JSON object mapping each job id to a boolean |
+| `reason` | Summary of the decision |
+| `fallback` | Why a fallback replaced a narrower plan; empty otherwise |
+| `<group>` | JSON array of the matrix entries to run (see [Matrix jobs](#matrix-jobs)) |
 
-Pull request, push, merge queue, schedule and manual events are read from the event payload. Cache the answers directory between runs so a re-run never pays for the same question twice:
+The range, event, labels and description are read from the event payload for `push`, `pull_request`, `merge_group`, `schedule` and `workflow_dispatch`.
+
+Cache the answer directory to reuse model answers across runs:
 
 ```yaml
       - uses: actions/cache@v4
@@ -108,11 +117,9 @@ Pull request, push, merge queue, schedule and manual events are read from the ev
           restore-keys: jevci-
 ```
 
-On a large repository, `filter: blob:none` keeps the plan job's checkout to seconds: history and trees arrive at once, and file contents only for the files jevci reads. jevci fetches those in batches (the changed files through `git diff`, the test files it searches for evidence in one request), where a plain read in a partial clone would fetch one file per request.
-
 ### Matrix jobs
 
-A job-level `if:` cannot read `matrix`, so a matrix job is planned per entry through a group: name its jobs `<workflow job>/<entry>` in the config, and the plan writes an output named after the group with the entries that run, as a JSON array. The workflow builds the matrix from it:
+A job-level `if:` cannot reference `matrix`, so matrix entries are planned as a group. Name the jobs `<workflow job>/<entry>` in the config. The plan outputs the entries to run under the group name, and the workflow builds its matrix from that output:
 
 ```yaml
   plan:
@@ -139,11 +146,11 @@ jobs: {
 },
 ```
 
-The list after `||` is every entry, so a failed plan job runs them all. `jevci check` verifies the guard, that the matrix reads the group output, that the fallback list names every entry, and that the plan job forwards the output. In dotenv, `test/api` becomes `JEVCI_RUN_TEST_API`.
+The list after `||` must name every entry, so that a failed plan runs all of them. `jevci check` verifies the guard, the matrix expression, the fallback list and the plan job's outputs. In dotenv output, `test/api` becomes `JEVCI_RUN_TEST_API`.
 
 ## Monorepos
 
-A job that tests or builds some workspace packages can fail after a change in any package they depend on, directly or not. `workspacePaths` turns package names into `paths` from the workspace graph (`pnpm-workspace.yaml`, or `workspaces` in `package.json` for npm, Yarn and Bun), when the config loads:
+A job that tests or builds some workspace packages can also fail after a change to their dependencies. `workspacePaths` derives `paths` from the workspace dependency graph (`pnpm-workspace.yaml`, or `workspaces` in `package.json` for npm, Yarn and Bun):
 
 ```ts
 import { defineConfig, readWorkspace, workspacePaths } from '@hazymoon/jevci';
@@ -159,22 +166,22 @@ export default defineConfig({
 });
 ```
 
-Names may be globs (`@acme/*`, or `**` for every package); a name that matches no package is a config error, so a renamed package cannot silently empty a job's paths. The result covers the packages' directories only: add the root files the job reads (its CI config, shared tsconfig, files its tests open by path) yourself, or put them in `full`.
+Package names accept globs (`@acme/*`, `**`). A name that matches no package is a config error. The result covers package directories only; add root files the job reads, such as CI config or a shared tsconfig, to its `paths` or to `full`.
 
-A test that reads another package's files by path is invisible to the dependency graph. When it reads only part of what changes there, a trigger keeps the job from running on every edit:
+Files a job reads outside the dependency graph, such as another package's sources scanned by a test, are declared as `triggers`. With a `pattern`, only changed lines that match it trigger the job:
 
 ```ts
 'test/admin-api': {
     checks: '...',
     paths: workspacePaths(['@acme/admin-api'], { workspace }),
-    // Its parity test counts which procedures the front end calls.
+    // The parity test counts the procedures the front end calls.
     triggers: [{ files: ['apps/front/src/**'], pattern: /\b(api|queries)\.[\w.]+\(/ }],
 },
 ```
 
 ## GitLab CI and other systems
 
-In GitLab CI, jevci reads `CI_PIPELINE_SOURCE`, `CI_MERGE_REQUEST_DIFF_BASE_SHA`, `CI_COMMIT_BEFORE_SHA`, `CI_COMMIT_SHA`, and the merge request's labels and description. `--format dotenv` prints `JEVCI_LEVEL` and one `JEVCI_RUN_<JOB>=true|false` per job, ready for a `dotenv` report:
+On GitLab, jevci reads `CI_PIPELINE_SOURCE`, `CI_MERGE_REQUEST_DIFF_BASE_SHA`, `CI_COMMIT_BEFORE_SHA`, `CI_COMMIT_SHA`, and the merge request's labels and description. `--format dotenv` prints `JEVCI_LEVEL` and one `JEVCI_RUN_<JOB>=true|false` line per job, for use as a dotenv report:
 
 ```yaml
 plan:
@@ -190,43 +197,43 @@ test:
     - npm test
 ```
 
-Anywhere else, pass the range yourself (`jevci plan --base origin/main --head HEAD --format json`), or call the API.
+On other systems, pass the range explicitly (`jevci plan --base origin/main --head HEAD --format json`) or use the [API](#api).
 
 ## Configuration
 
-| Option | Default | Meaning |
+| Option | Default | Description |
 | --- | --- | --- |
-| `jobs.<id>.checks` | required | What the job verifies and what it cannot observe. Jev judges by this text. |
-| `jobs.<id>.paths` | `['**']` | Files whose changes can matter to the job. |
-| `jobs.<id>.exclude` | `[]` | Removed from `paths`. |
-| `jobs.<id>.owns` | `[]` | Files the job executes or reads directly (its tests, its config). A real change here runs the job without asking Jev. |
-| `jobs.<id>.downgrade` | `true` | `false`: Jev never drops this job. |
-| `jobs.<id>.formatting` | `false` | The job reads comments or formatting (a linter), so comment-only edits still run it. |
-| `jobs.<id>.threshold` | `jev.threshold` | Per-job threshold. |
-| `jobs.<id>.minutes` | none | Typical duration, for `replay` and summaries. |
-| `jobs.<id>.triggers` | `[]` | `{ files, pattern? }` rules for files outside `paths` that the job still reads (a test that scans another package). A change there runs the job when an added or removed line matches `pattern`, or on any change without one. |
-| `full` | `[]` | Globs that run every job. |
-| `ignore` | `[]` | Globs no job reads. Added or edited files are dropped. Deleted or renamed ones still count, since a link may point at them. |
-| `minimumJobs` | `[]` | Jobs that run on any real change. |
-| `force.markers` / `labels` / `events` | `['[ci full]']` / `['ci:full']` / `['schedule', 'workflow_dispatch', 'web']` | What runs every job. |
-| `noop.directives` | `DEFAULT_DIRECTIVES` | Comments that change tool behaviour; editing one is a real change. |
-| `noop.normalizers` | `[]` | Extra file types for comment-only detection (see below). `noop: false` turns detection off. |
-| `jev.threshold` | `0.2` | Keep a job when P(can fail) ≥ threshold. Lower is safer. |
-| `jev.context` | none | A few sentences about the repository: framework, test style, code that runs at build time. |
-| `jev.testFiles` | `['**/*.test.*', '**/*.spec.*', '**/__tests__/**', 'test/**', 'tests/**']` | Where to look for text an edit removes. |
-| `jev.provider` | the first of gateway, typesafe, openrouter whose key is set | See "Providers". `jev: false` never asks. |
-| `jev.maxFiles` / `maxDiffChars` / `maxTokens` / `timeoutSeconds` | `80` / `16000` / `400000` / `180` | Beyond these limits, the jobs the rules chose run. |
-| `jev.cacheDir` / `concurrency` | `~/.cache/jevci` / `8` | Answer cache and parallel requests. |
+| `jobs.<id>.checks` | required | What the job verifies and what it cannot detect. Read by the model pass. |
+| `jobs.<id>.paths` | `['**']` | Files that can affect the job. |
+| `jobs.<id>.exclude` | `[]` | Globs removed from `paths`. |
+| `jobs.<id>.owns` | `[]` | Files the job runs directly, such as its tests or config. A change runs the job without the model pass. |
+| `jobs.<id>.downgrade` | `true` | `false` excludes the job from the model pass. |
+| `jobs.<id>.formatting` | `false` | The job checks comments or formatting (a linter) and runs on comment-only edits. |
+| `jobs.<id>.threshold` | `jev.threshold` | Threshold for this job. |
+| `jobs.<id>.minutes` | none | Typical duration, used by `replay` and in summaries. |
+| `jobs.<id>.triggers` | `[]` | `{ files, pattern? }` entries for files outside `paths` that the job reads. A change runs the job when an added or removed line matches `pattern`, or on any change if `pattern` is omitted. |
+| `full` | `[]` | Files that run every job. |
+| `ignore` | `[]` | Files no job reads. Deleting or renaming one still counts as a change. |
+| `minimumJobs` | `[]` | Jobs that run on any change that is not ignored or comment-only. |
+| `force.markers` / `labels` / `events` | `['[ci full]']` / `['ci:full']` / `['schedule', 'workflow_dispatch', 'web']` | Commit or description markers, labels and events that run every job. |
+| `noop.directives` | `DEFAULT_DIRECTIVES` | Comments that change tool behavior. Editing one counts as a code change. |
+| `noop.normalizers` | `[]` | Comment-only detection for more file types (see [Custom normalizers](#custom-normalizers)). `noop: false` disables detection. |
+| `jev.threshold` | `0.2` | A job is kept when the probability of failure is at least this value. Lower is more conservative. |
+| `jev.context` | none | A short description of the repository: framework, test setup, code that runs at build time. |
+| `jev.testFiles` | `['**/*.test.*', '**/*.spec.*', '**/__tests__/**', 'test/**', 'tests/**']` | Test files searched for text an edit removes. |
+| `jev.provider` | first provider with a key | See [Providers](#providers). `jev: false` disables the model pass. |
+| `jev.maxFiles` / `maxDiffChars` / `maxTokens` / `timeoutSeconds` | `80` / `16000` / `400000` / `180` | Limits for the model pass. Beyond them, the rule-based plan is used. |
+| `jev.cacheDir` / `concurrency` | `~/.cache/jevci` / `8` | Answer cache and concurrent requests. |
 
-Globs match whole paths, and `*` and `**` include dotfiles: `**` covers `.github/`.
+Globs match whole paths. `*` and `**` match dotfiles, so `**` includes `.github/`.
 
 ### Writing `checks`
 
-Jev judges a job by its description alone, so name what the job cannot observe. For example: "It does not check the contents of plain strings". Or: "Type-only changes cannot fail it: Vitest strips types". Or: "It never runs the code, except the /offline page it prerenders". Put facts about the whole repository in `jev.context`. Then run `jevci eval` on labelled cases before lowering the threshold.
+The model pass sees only the job's `checks`, so state what the job cannot detect, for example "Does not check the contents of string literals" or "Type-only changes cannot fail it; Vitest strips types". Put repository-wide facts in `jev.context`. Measure with `jevci eval` before lowering the threshold.
 
-### More file types
+### Custom normalizers
 
-A normalizer returns the content with everything no job can observe removed, or `undefined` when it is unsure. Custom normalizers run before the built-in ones (scripts, Vue, JSON, HTML/SVG/XML, CSS):
+A normalizer returns the file content with everything the jobs cannot observe removed, or `undefined` if it cannot decide. Custom normalizers run before the built-in ones (scripts, Vue, JSON, HTML/SVG/XML, CSS):
 
 ```ts
 import { parse } from 'yaml';
@@ -234,7 +241,7 @@ import { parse } from 'yaml';
 export default defineConfig({
     noop: {
         normalizers: [
-            // Comments and layout drop out when YAML is compared by value.
+            // Compare YAML by value, so comments and layout drop out.
             { files: ['**/*.{yml,yaml}'], normalize: text => JSON.stringify(parse(text)) },
         ],
     },
@@ -244,24 +251,26 @@ export default defineConfig({
 
 ## Commands
 
-| Command | Does |
+| Command | Description |
 | --- | --- |
-| `jevci plan` | Prints the plan. `--format text\|json\|markdown\|github\|dotenv`, `--output plan.json`, `--no-jev`, `--base`, `--head`, `--event`, `--labels`. Always exits 0, and a failure inside jevci yields a plan that runs every job. |
-| `jevci check` | Checks that every configured job needs the plan job and reads `needs.<plan>.outputs.jobs`, and that no job is missing from either side. Exits 1 on errors. |
-| `jevci init` | Writes a starting config from the workflow's jobs. |
-| `jevci replay` | Plans the last `--last N` first-parent commits and totals the job minutes saved. Commits the workflow's own `push` path filter never runs on are listed but left out of the totals. `--jev` includes Jev, capped by `--max-tokens`. |
-| `jevci eval` | Scores the judge on labelled cases (`{"id", "file", "diff", "evidence"?, "expect": {"<job>": true}}` per line) at several thresholds. `--answers` records answers for offline re-runs. |
+| `jevci plan` | Print the plan. Options: `--format text\|json\|markdown\|github\|dotenv`, `--output <file>`, `--base`, `--head`, `--event`, `--labels`, `--no-jev`. Always exits 0; if jevci fails, the plan runs every job. |
+| `jevci check` | Validate the workflow: every configured job depends on the plan job and reads its output, and the job ids in the workflow and config match. Exits 1 on errors. |
+| `jevci init` | Generate a config from the workflow's jobs. |
+| `jevci replay` | Plan the last `--last N` first-parent commits and total the job minutes saved. Commits excluded by the workflow's `push` path filters are listed but not counted. `--jev` includes the model pass, capped by `--max-tokens`. |
+| `jevci eval` | Score the model pass on labelled cases at several thresholds. Cases are JSON lines: `{"id", "file", "diff", "evidence"?, "expect": {"<job>": true}}`. `--answers` records answers for offline runs. |
 
-A config error exits 2 with every problem listed.
+Configuration errors exit with code 2 and list every problem.
 
 ## Providers
 
-- `gateway` (default when `AI_GATEWAY_API_KEY` is set): Vercel AI Gateway.
-- `typesafe`: api.typesafe.ai, pinned to a model version, with `TYPESAFE_API_KEY`.
-- `openrouter`: OpenRouter's decisions endpoint, pinned to `typesafe/jev-1.13` by default, with `OPENROUTER_API_KEY`.
-- `replay`: cached answers only, and nothing is sent.
+| Provider | API key | Notes |
+| --- | --- | --- |
+| `gateway` | `AI_GATEWAY_API_KEY` | Vercel AI Gateway. |
+| `typesafe` | `TYPESAFE_API_KEY` | api.typesafe.ai, pinned to a model version. |
+| `openrouter` | `OPENROUTER_API_KEY` | OpenRouter. Default model `typesafe/jev-1.13`. |
+| `replay` | none | Cached answers only. Sends no requests. |
 
-Answers are cached by model, state and question, so re-planning the same change is free. Requests retry on rate limits (following `retry-after`), server errors and dropped connections; a rejected key or an account without credits fails at once, and the plan keeps the jobs the rules chose. jevci never reads `.env` files. Export the key in the job that runs it.
+Without `jev.provider`, the first provider in this table whose key is set is used. Answers are cached by model, input and question. Rate limits, server errors and network failures are retried; other errors fall back to the rule-based plan. jevci does not read `.env` files.
 
 ## API
 
@@ -280,15 +289,15 @@ const plan = await createPlan(config, {
 });
 ```
 
-`createJevJudge` throws `JevciKeyError` when the provider's API key is missing; leave `judge` out to plan by the rules alone. Any object with `ask(state, questions) → Promise<Record<id, P(yes)>>` can serve as the `judge`: another model, a rule table, or a stub in tests. `plan.schemaVersion` changes only on breaking changes to the JSON shape.
+`createJevJudge` throws `JevciKeyError` if the provider's API key is missing. Omit `judge` to plan with rules only. Any object with `ask(state, questions)` returning `Promise<Record<string, number>>` (the probability of "yes" per question) can serve as the judge. `plan.schemaVersion` changes only when the plan's JSON shape changes incompatibly.
 
-## Limits
+## Limitations
 
-- The rules are only as good as `paths`. A job that reads files outside its `paths` can be skipped wrongly. Keep a nightly full run (`schedule` does that by default) and use `jevci replay` to check a new config against history.
-- Comment-only detection covers scripts, Vue, JSON, markup and CSS. For other text files, only line endings and trailing whitespace are normalized. A test that reads source files as text can still see a comment change. Give such a job `formatting: true`.
-- A file over 1 MiB is not compared as text: any edit to it runs its jobs.
-- Jev judges one file at a time. A change that only breaks in combination with another file's change still runs the jobs either file needs on its own.
+- A plan is only as accurate as `paths`. A job that reads files outside its `paths` can be skipped incorrectly. Keep a scheduled full run (`schedule` runs every job by default), and check a new config against history with `jevci replay`.
+- Comment-only detection covers scripts, Vue, JSON, markup and CSS. Other text files are compared after normalizing line endings and trailing whitespace. A job that reads source files as text should set `formatting: true`.
+- Files larger than 1 MiB are not compared; any change to one runs its jobs.
+- The model pass judges each file separately. It does not consider failures that arise only from the combination of changes in several files.
 
 ## License
 
-MIT
+[MIT](LICENSE)
